@@ -1,0 +1,5 @@
+*.local
+*.sh
+
+main
+main.exe
