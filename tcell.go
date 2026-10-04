@@ -1,20 +1,24 @@
 package main
 
-import "github.com/gdamore/tcell/v2"
+import (
+	"github.com/gdamore/tcell/v2"
+	"github.com/mattn/go-runewidth"
+)
 
-func tCellDraw(screen tcell.Screen, x1, y1, x2, y2 int, style tcell.Style, text string) {
-	row := y1
-	col := x1
+// tCellDraw draws text on row y starting at column x, cut off at the right edge of the screen.
+func tCellDraw(screen tcell.Screen, x, y int, style tcell.Style, text string) {
+	screenW, _ := screen.Size()
 	for _, r := range text {
-		screen.SetContent(col, row, r, nil, style)
-		col++
-		if col >= x2 {
-			row++
-			col = x1
+		width := runewidth.RuneWidth(r)
+		if width == 0 {
+			// Control characters and combining marks would corrupt the layout.
+			continue
 		}
-		if row > y2 {
+		if x+width > screenW {
 			break
 		}
+		screen.SetContent(x, y, r, nil, style)
+		x += width
 	}
 }
 
