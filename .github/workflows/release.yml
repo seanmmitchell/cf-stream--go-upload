@@ -6,13 +6,57 @@ on:
       - "v[0-9]*"
   pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag and publish from the default branch, e.g. v0.0.1. Leave empty to only build."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  meta:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      publish: ${{ steps.resolve.outputs.publish }}
+    steps:
+      - id: resolve
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          publish=false
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="$GITHUB_REF_NAME"
+            publish=true
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && -n "$INPUT_VERSION" ]]; then
+            semver='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+            if [[ ! "$INPUT_VERSION" =~ $semver ]]; then
+              echo "::error::version must look like v1.2.3 or v1.2.3-rc1"
+              exit 1
+            fi
+            if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+              echo "::error::releases can only be dispatched from $DEFAULT_BRANCH"
+              exit 1
+            fi
+            version="$INPUT_VERSION"
+            publish=true
+          else
+            version="${HEAD_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: meta
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -45,21 +89,16 @@ jobs:
       - name: Build and package
         shell: bash
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "tag" ]]; then
-            version="$GITHUB_REF_NAME"
-          else
-            version="${HEAD_SHA::7}"
-          fi
           bin="cfsgo"
           [[ "$GOOS" == "windows" ]] && bin="cfsgo.exe"
           stage="$RUNNER_TEMP/stage"
           mkdir -p "$stage" dist
           go build -trimpath -ldflags="-s -w" -o "$stage/$bin" .
           cp README.md "$stage/"
-          archive="cfsgo_${version}_${GOOS}_${GOARCH}"
+          archive="cfsgo_${VERSION}_${GOOS}_${GOARCH}"
           if [[ "$GOOS" == "windows" ]]; then
             (cd "$stage" && zip -q "$GITHUB_WORKSPACE/dist/$archive.zip" "$bin" README.md)
           else
@@ -76,14 +115,14 @@ jobs:
 
   release:
     name: Publish GitHub release
-    needs: build
-    # Only tag pushes publish; a manual run on a tag ref only builds.
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [meta, build]
+    # Tag pushes, or a manual run on the default branch with a version.
+    if: needs.meta.outputs.publish == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     concurrency:
-      group: release-${{ github.ref }}
+      group: release-${{ needs.meta.outputs.version }}
       cancel-in-progress: false
     steps:
       - uses: actions/download-artifact@v8
@@ -99,19 +138,39 @@ jobs:
       - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
-          tag="$GITHUB_REF_NAME"
-          # Re-runs, or a release already drafted in the UI, get their
-          # assets replaced instead of failing.
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
-            exit 0
-          fi
+          tag="$VERSION"
           flags=()
           # Tags like v1.2.0-rc1 are published as pre-releases; "+build"
           # metadata is ignored when checking for the "-".
           [[ "${tag%%+*}" == *-* ]] && flags+=(--prerelease)
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            # Create the tag at the commit that was just built. Never reuse an
+            # existing tag: its release would get binaries from another commit.
+            existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+              --jq "map(select(.ref == \"refs/tags/$tag\")) | length")
+            if [[ "$existing" != "0" ]]; then
+              echo "::error::tag $tag already exists; choose a new version"
+              exit 1
+            fi
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" \
+              --generate-notes \
+              --target "$GITHUB_SHA" \
+              "${flags[@]}"
+            exit 0
+          fi
+
+          # Tag push: re-runs, or a release already drafted in the UI, get
+          # their assets replaced instead of failing.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            exit 0
+          fi
           gh release create "$tag" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$tag" \
