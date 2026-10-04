@@ -9,10 +9,12 @@ import (
 	"github.com/gdamore/tcell/v2"
 )
 
-var (
-	errInterrupted = errors.New("upload interrupted")
-	errTerminated  = errors.New("upload terminated")
-)
+var errInterrupted = errors.New("upload interrupted")
+
+// stopSignal is the error runUI returns when a signal other than SIGINT ends it.
+type stopSignal struct{ sig syscall.Signal }
+
+func (s stopSignal) Error() string { return fmt.Sprintf("upload stopped by signal (%s)", s.sig) }
 
 // view holds the fixed details shown above the upload's progress.
 type view struct {
@@ -23,18 +25,12 @@ type view struct {
 }
 
 // runUI shows the upload's progress until the worker reports on done, the
-// user quits with Ctrl-C or SIGINT (errInterrupted), or SIGTERM arrives
-// (errTerminated). signals must be registered before screen.Init. runUI is
-// the only code that touches screen, and it calls Fini before returning, also
+// user quits with Ctrl-C or SIGINT (errInterrupted), or another signal arrives
+// (stopSignal). signals must be registered before screen.Init. runUI is the
+// only code that touches screen, and it calls Fini before returning, also
 // when it panics.
 func runUI(screen tcell.Screen, v view, updates <-chan progress, done <-chan error, signals <-chan os.Signal) (last progress, err error) {
-	defer func() {
-		p := recover()
-		screen.Fini()
-		if p != nil {
-			panic(p)
-		}
-	}()
+	defer screen.Fini()
 
 	// Events are read on tcell's goroutine and handled here, never acted on there.
 	events := make(chan tcell.Event)
@@ -50,8 +46,8 @@ func runUI(screen tcell.Screen, v view, updates <-chan progress, done <-chan err
 		case uploadErr := <-done:
 			return last, uploadErr
 		case sig := <-signals:
-			if sig == syscall.SIGTERM {
-				return last, errTerminated
+			if s, ok := sig.(syscall.Signal); ok && sig != os.Interrupt {
+				return last, stopSignal{s}
 			}
 			return last, errInterrupted
 		case ev, ok := <-events:

@@ -4,13 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"os"
 	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"syscall"
-	"time"
 
 	"github.com/eventials/go-tus"
 	"github.com/eventials/go-tus/memorystore"
@@ -130,8 +128,9 @@ func main() {
 		os.Exit(1)
 		return
 	}
-	if !fileInfo.Mode().IsRegular() {
-		le.Log(ale.Critical, fmt.Sprintf("File is not a regular file: %s", file))
+	// Not !IsRegular(): on Windows that also rejects OneDrive and other reparse-point files.
+	if fileInfo.Mode()&(os.ModeDir|os.ModeNamedPipe|os.ModeSocket|os.ModeDevice|os.ModeCharDevice) != 0 {
+		le.Log(ale.Critical, fmt.Sprintf("File must be a regular file, not a directory, pipe, socket or device: %s", file))
 		os.Exit(1)
 	}
 	fileSize := fileInfo.Size()
@@ -147,10 +146,8 @@ func main() {
 	// Resume keeps the upload URL in the store, so after a failed chunk the
 	// uploader can re-read the server's offset (ResumeUpload) before resending.
 	store, _ := memorystore.NewMemoryStore()
-	// go-tus never passes a context, so bound how long a request may wait for a
-	// reply once it is sent. A timeout is retried like any other network error.
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.ResponseHeaderTimeout = 2 * time.Minute
+	// ctx is the upload worker's; cancelling it also aborts in-flight requests.
+	ctx, cancel := context.WithCancel(context.Background())
 	config := &tus.Config{
 		ChunkSize:           chunkSize * 1024 * 1024,
 		Resume:              true,
@@ -159,7 +156,7 @@ func main() {
 		Header: map[string][]string{
 			"Authorization": {fmt.Sprintf("Bearer %s", apiToken)},
 		},
-		HttpClient: &http.Client{Transport: transport},
+		HttpClient: newHTTPClient(ctx),
 	}
 
 	client, err := tus.NewClient(fmt.Sprintf(endpoint, accountID), config)
@@ -175,9 +172,10 @@ func main() {
 	}
 	//#endregion TUS Client
 
-	// Catch signals before the terminal goes raw, so none can skip Fini.
+	// Catch the usual stop signals before the terminal goes raw, so they can't
+	// skip Fini. SIGQUIT keeps Go's default so it can still dump goroutines.
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
 	// Set up the screen before the upload is created on the server, so a
 	// missing or unusable terminal stops here without leaving a partial upload.
@@ -193,7 +191,6 @@ func main() {
 
 	// The worker owns the upload and only reports progress. runUI owns the
 	// screen and restores the terminal before it returns.
-	ctx, cancel := context.WithCancel(context.Background())
 	updates := make(chan progress)
 	done := make(chan error, 1)
 	retry := defaultRetry
@@ -216,17 +213,23 @@ func main() {
 	last, err := runUI(screen, v, updates, done, signals)
 	cancel()
 
+	// Name the partial upload, so it can be found and deleted in the dashboard.
+	partial := ""
+	if last.url != "" {
+		partial = fmt.Sprintf(" Partial upload: %s", last.url)
+	}
+	var stop stopSignal
 	switch {
 	case err == nil:
 		le.Log(ale.Info, fmt.Sprintf("Upload complete. %d bytes sent to %s", last.offset, last.url))
 	case errors.Is(err, errInterrupted):
-		le.Log(ale.Warning, fmt.Sprintf("Upload cancelled after %d of %d bytes.", last.offset, fileSize))
+		le.Log(ale.Warning, fmt.Sprintf("Upload cancelled after %d of %d bytes.%s", last.offset, fileSize, partial))
 		os.Exit(130)
-	case errors.Is(err, errTerminated):
-		le.Log(ale.Warning, fmt.Sprintf("Upload terminated after %d of %d bytes.", last.offset, fileSize))
-		os.Exit(143)
+	case errors.As(err, &stop):
+		le.Log(ale.Warning, fmt.Sprintf("Upload stopped by signal (%s) after %d of %d bytes.%s", stop.sig, last.offset, fileSize, partial))
+		os.Exit(128 + int(stop.sig))
 	default:
-		le.Log(ale.Critical, fmt.Sprintf("Upload failed after %d of %d bytes. Err: %s", last.offset, fileSize, err))
+		le.Log(ale.Critical, fmt.Sprintf("Upload failed after %d of %d bytes.%s Err: %s", last.offset, fileSize, partial, describe(err)))
 		os.Exit(1)
 	}
 }

@@ -84,13 +84,14 @@ func TestRunUIMapsSignals(t *testing.T) {
 		want error
 	}{
 		{os.Interrupt, errInterrupted},
-		{syscall.SIGTERM, errTerminated},
+		{syscall.SIGTERM, stopSignal{syscall.SIGTERM}},
+		{syscall.SIGHUP, stopSignal{syscall.SIGHUP}},
 	}
 	for _, tt := range tests {
 		screen := newSimScreen(t)
 		signals := make(chan os.Signal, 1)
 		signals <- tt.sig
-		if _, err := runUI(screen, view{}, nil, nil, signals); !errors.Is(err, tt.want) {
+		if _, err := runUI(screen, view{}, nil, nil, signals); err != tt.want {
 			t.Errorf("runUI after %v: err = %v, want %v", tt.sig, err, tt.want)
 		}
 	}

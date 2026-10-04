@@ -5,8 +5,12 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/eventials/go-tus"
@@ -28,7 +32,10 @@ type retryPolicy struct {
 	maxDelay   time.Duration // Cap on a single wait.
 }
 
-var defaultRetry = retryPolicy{maxRetries: 8, baseDelay: time.Second, maxDelay: 30 * time.Second}
+// defaultRetry rides out about 10 minutes of consecutive failures
+// (1+2+4+8+16+32s, then 60s each), long enough for a router reboot or a short
+// outage, since a failed upload cannot be resumed by a later run.
+var defaultRetry = retryPolicy{maxRetries: 15, baseDelay: time.Second, maxDelay: time.Minute}
 
 // delay returns the wait before retry number attempt (starting at 1).
 func (r retryPolicy) delay(attempt int) time.Duration {
@@ -39,13 +46,18 @@ func (r retryPolicy) delay(attempt int) time.Duration {
 	return min(d, r.maxDelay)
 }
 
-// errNoProgress means the server accepted a chunk without moving the offset.
-var errNoProgress = errors.New("server did not advance the upload offset")
+var (
+	// errNoProgress means the server accepted a chunk without moving the offset.
+	errNoProgress = errors.New("server did not advance the upload offset")
+	// errStalled means a request body stopped being sent (see stallGuard).
+	errStalled = errors.New("upload stalled: no data sent")
+)
 
-// retryable reports whether err may clear up on its own: a network failure,
-// a server error, rate limiting, a locked upload, or an offset mismatch, which
-// a resync fixes. Everything else (bad token, upload too large, untrusted TLS
-// certificate, malformed URL, local file errors) is permanent.
+// retryable reports whether err may clear up on its own: a server error, rate
+// limiting, a locked upload, an offset mismatch (which a resync fixes), or a
+// transport failure (timeout, reset, DNS or dial error, connection closed
+// early, stall). Everything else (bad token, upload too large, untrusted TLS
+// certificate, proxy or URL errors, cancellation, local file errors) is permanent.
 func retryable(err error) bool {
 	if errors.Is(err, tus.ErrOffsetMismatch) || errors.Is(err, errNoProgress) {
 		return true
@@ -63,7 +75,125 @@ func retryable(err error) bool {
 		return false
 	}
 	var urlErr *url.Error
-	return errors.As(err, &urlErr) && urlErr.Op != "parse"
+	if !errors.As(err, &urlErr) {
+		return false
+	}
+	var netErr net.Error
+	return errors.As(urlErr.Err, &netErr) || errors.Is(urlErr.Err, io.EOF) ||
+		errors.Is(urlErr.Err, io.ErrUnexpectedEOF) || errors.Is(urlErr.Err, errStalled)
+}
+
+// describe returns err's message, plus the start of the server's reply for a
+// status-code error, since go-tus only says "unexpected status code: N".
+func describe(err error) string {
+	var clientErr tus.ClientError
+	if !errors.As(err, &clientErr) {
+		return err.Error()
+	}
+	body := strings.TrimSpace(string(clientErr.Body))
+	if body == "" {
+		return err.Error()
+	}
+	if len(body) > 300 {
+		body = strings.ToValidUTF8(body[:300], "") + "..."
+	}
+	return fmt.Sprintf("%s: %s", err, body)
+}
+
+// newHTTPClient returns the client go-tus uses. stallGuard gives requests ctx
+// and fails a stalled body, and ResponseHeaderTimeout bounds the wait for a
+// reply; both are retried like any other network error. HTTP/1.1 only, so
+// transport failures surface as the net errors retryable() checks for rather
+// than HTTP/2 stream errors.
+func newHTTPClient(ctx context.Context) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 2 * time.Minute
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	return &http.Client{Transport: stallGuard{ctx: ctx, idle: time.Minute, next: transport}}
+}
+
+// stallGuard is an http.RoundTripper that ties every request to ctx and
+// fails one with errStalled when its body is not read for idle, which is how
+// a black-holed connection shows up while a chunk is being sent. go-tus builds
+// requests without a context, so this is the only place to add one. The wait
+// for the reply after the body is sent is bounded by ResponseHeaderTimeout.
+type stallGuard struct {
+	ctx  context.Context
+	idle time.Duration
+	next http.RoundTripper
+}
+
+func (g stallGuard) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithCancelCause(g.ctx)
+	req = req.WithContext(ctx)
+	var body *watchedBody
+	if req.Body != nil && req.Body != http.NoBody {
+		body = &watchedBody{ReadCloser: req.Body, idle: g.idle}
+		body.timer = time.AfterFunc(g.idle, func() { cancel(errStalled) })
+		req.Body = body
+	}
+
+	resp, err := g.next.RoundTrip(req)
+	if body != nil {
+		body.stop()
+	}
+	if err != nil {
+		cancel(nil)
+		if errors.Is(context.Cause(ctx), errStalled) {
+			return nil, errStalled
+		}
+		return nil, err
+	}
+	// The reply is read under ctx, so only cancel it once the reply is closed.
+	resp.Body = cancelOnClose{ReadCloser: resp.Body, cancel: func() { cancel(nil) }}
+	return resp, nil
+}
+
+// watchedBody restarts its timer on every read and stops it at the end of the body.
+type watchedBody struct {
+	io.ReadCloser
+	idle  time.Duration
+	mu    sync.Mutex
+	timer *time.Timer
+	done  bool
+}
+
+func (b *watchedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.stop()
+		return n, err
+	}
+	b.mu.Lock()
+	if !b.done {
+		b.timer.Reset(b.idle)
+	}
+	b.mu.Unlock()
+	return n, err
+}
+
+func (b *watchedBody) Close() error {
+	b.stop()
+	return b.ReadCloser.Close()
+}
+
+func (b *watchedBody) stop() {
+	b.mu.Lock()
+	b.done = true
+	b.timer.Stop()
+	b.mu.Unlock()
+}
+
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel func()
+}
+
+func (c cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
 
 // uploadFile creates the upload on the server and sends it chunk by chunk
@@ -86,7 +216,13 @@ func uploadFile(ctx context.Context, client *tus.Client, upload *tus.Upload, ret
 		}
 		p.err, p.attempt, p.retryIn = err, failures, retry.delay(failures)
 		report(p)
-		return sleep(ctx, p.retryIn)
+		if err := sleep(ctx, p.retryIn); err != nil {
+			return err
+		}
+		// The wait is over; show that the retry is in progress.
+		p.retryIn = 0
+		report(p)
+		return nil
 	}
 
 	// Repeating this is safe; at worst a lost response leaves an empty upload behind.
@@ -95,18 +231,17 @@ func uploadFile(ctx context.Context, client *tus.Client, upload *tus.Upload, ret
 		if stop := backoff(err); stop != nil {
 			return fmt.Errorf("failed to create upload: %w", stop)
 		}
-		p.retryIn = 0
-		report(p)
 		uploader, err = client.CreateUpload(upload)
 	}
 
 	p, failures = progress{url: uploader.Url()}, 0
 	for uploader.Offset() < upload.Size() {
+		p.offset, p.retryIn = uploader.Offset(), 0
+		report(p)
+		// report returns early once ctx is cancelled, so check before sending more.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		p.offset, p.retryIn = uploader.Offset(), 0
-		report(p)
 
 		err := uploader.UploadChunck()
 		if err == nil && uploader.Offset() <= p.offset {
