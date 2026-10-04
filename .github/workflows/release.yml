@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]*"
   pull_request:
   workflow_dispatch:
 
@@ -35,18 +35,23 @@ jobs:
 
       # Build with the latest patched Go release so shipped binaries carry
       # current stdlib security fixes; go.mod's go line is only the minimum.
+      # No cache: the matrix legs would share one key, and release builds
+      # should not depend on cache contents.
       - uses: actions/setup-go@v6
         with:
           go-version: stable
+          cache: false
 
       - name: Build and package
         shell: bash
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "tag" ]]; then
             version="$GITHUB_REF_NAME"
           else
-            version="${GITHUB_SHA::7}"
+            version="${HEAD_SHA::7}"
           fi
           bin="cfsgo"
           [[ "$GOOS" == "windows" ]] && bin="cfsgo.exe"
@@ -72,10 +77,14 @@ jobs:
   release:
     name: Publish GitHub release
     needs: build
-    if: github.ref_type == 'tag'
+    # Only tag pushes publish; a manual run on a tag ref only builds.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -87,17 +96,25 @@ jobs:
         working-directory: dist
         run: sha256sum -- * > SHA256SUMS.txt
 
-      - name: Create release
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          # Re-runs, or a release already drafted in the UI, get their
+          # assets replaced instead of failing.
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            exit 0
+          fi
           flags=()
-          # Tags like v1.2.0-rc1 are published as pre-releases.
-          [[ "$GITHUB_REF_NAME" == *-* ]] && flags+=(--prerelease)
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          # Tags like v1.2.0-rc1 are published as pre-releases; "+build"
+          # metadata is ignored when checking for the "-".
+          [[ "${tag%%+*}" == *-* ]] && flags+=(--prerelease)
+          gh release create "$tag" dist/* \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$GITHUB_REF_NAME" \
+            --title "$tag" \
             --generate-notes \
             --verify-tag \
             "${flags[@]}"
