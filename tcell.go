@@ -4,13 +4,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/signal"
 	"syscall"
 
 	"github.com/gdamore/tcell/v2"
 )
 
-var errInterrupted = errors.New("upload interrupted")
+var (
+	errInterrupted = errors.New("upload interrupted")
+	errTerminated  = errors.New("upload terminated")
+)
 
 // view holds the fixed details shown above the upload's progress.
 type view struct {
@@ -20,11 +22,12 @@ type view struct {
 	maxRetries int
 }
 
-// runUI shows the upload's progress until the worker reports on done, or the
-// user quits with Ctrl-C or the process gets SIGINT/SIGTERM (errInterrupted).
-// It is the only code that touches screen, and it calls Fini before returning
-// (also when it panics), so the terminal is restored on every exit path.
-func runUI(screen tcell.Screen, v view, updates <-chan progress, done <-chan error) (last progress, err error) {
+// runUI shows the upload's progress until the worker reports on done, the
+// user quits with Ctrl-C or SIGINT (errInterrupted), or SIGTERM arrives
+// (errTerminated). signals must be registered before screen.Init. runUI is
+// the only code that touches screen, and it calls Fini before returning, also
+// when it panics.
+func runUI(screen tcell.Screen, v view, updates <-chan progress, done <-chan error, signals <-chan os.Signal) (last progress, err error) {
 	defer func() {
 		p := recover()
 		screen.Fini()
@@ -39,10 +42,6 @@ func runUI(screen tcell.Screen, v view, updates <-chan progress, done <-chan err
 	defer close(quit)
 	go screen.ChannelEvents(events, quit)
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(signals)
-
 	for {
 		drawProgress(screen, v, last)
 
@@ -50,7 +49,10 @@ func runUI(screen tcell.Screen, v view, updates <-chan progress, done <-chan err
 		case last = <-updates:
 		case uploadErr := <-done:
 			return last, uploadErr
-		case <-signals:
+		case sig := <-signals:
+			if sig == syscall.SIGTERM {
+				return last, errTerminated
+			}
 			return last, errInterrupted
 		case ev, ok := <-events:
 			if !ok {
@@ -95,12 +97,12 @@ func drawProgress(screen tcell.Screen, v view, p progress) {
 
 	// Status, wrapped over two rows since errors can be long.
 	switch {
-	case p.url == "":
-		line = "Status: Creating upload..."
 	case p.retryIn > 0:
 		line = fmt.Sprintf("Status: Retrying in %s (attempt %d of %d). Err: %s", p.retryIn, p.attempt, v.maxRetries, p.err)
 	case p.err != nil:
 		line = fmt.Sprintf("Status: Retrying (attempt %d of %d). Err: %s", p.attempt, v.maxRetries, p.err)
+	case p.url == "":
+		line = "Status: Creating upload..."
 	default:
 		line = "Status: Uploading..."
 	}

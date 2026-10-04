@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -38,19 +39,31 @@ func (r retryPolicy) delay(attempt int) time.Duration {
 	return min(d, r.maxDelay)
 }
 
+// errNoProgress means the server accepted a chunk without moving the offset.
+var errNoProgress = errors.New("server did not advance the upload offset")
+
 // retryable reports whether err may clear up on its own: a network failure,
-// a server error, rate limiting, or an offset mismatch, which a resync fixes.
-// Everything else (bad token, upload too large, local file errors) is permanent.
+// a server error, rate limiting, a locked upload, or an offset mismatch, which
+// a resync fixes. Everything else (bad token, upload too large, untrusted TLS
+// certificate, malformed URL, local file errors) is permanent.
 func retryable(err error) bool {
-	if errors.Is(err, tus.ErrOffsetMismatch) {
+	if errors.Is(err, tus.ErrOffsetMismatch) || errors.Is(err, errNoProgress) {
 		return true
 	}
 	var clientErr tus.ClientError
 	if errors.As(err, &clientErr) {
-		return clientErr.Code == http.StatusRequestTimeout || clientErr.Code == http.StatusTooManyRequests || clientErr.Code >= 500
+		switch clientErr.Code {
+		case http.StatusRequestTimeout, http.StatusLocked, http.StatusTooManyRequests:
+			return true
+		}
+		return clientErr.Code >= 500
+	}
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return false
 	}
 	var urlErr *url.Error
-	return errors.As(err, &urlErr)
+	return errors.As(err, &urlErr) && urlErr.Op != "parse"
 }
 
 // uploadFile creates the upload on the server and sends it chunk by chunk
@@ -59,18 +72,46 @@ func retryable(err error) bool {
 // stored the chunk even though the response was lost. The client must have
 // Resume enabled so ResumeUpload can look the upload up again.
 func uploadFile(ctx context.Context, client *tus.Client, upload *tus.Upload, retry retryPolicy, report func(progress)) error {
-	uploader, err := client.CreateUpload(upload)
-	if err != nil {
-		return fmt.Errorf("failed to create upload: %w", err)
+	var p progress
+	failures := 0
+	// backoff counts a failure and waits before the next attempt. It returns
+	// an error instead if err is permanent, retries are used up, or ctx ends.
+	backoff := func(err error) error {
+		if !retryable(err) {
+			return err
+		}
+		failures++
+		if failures > retry.maxRetries {
+			return fmt.Errorf("gave up after %d retries: %w", retry.maxRetries, err)
+		}
+		p.err, p.attempt, p.retryIn = err, failures, retry.delay(failures)
+		report(p)
+		return sleep(ctx, p.retryIn)
 	}
 
-	p := progress{url: uploader.Url()}
-	failures := 0
+	// Repeating this is safe; at worst a lost response leaves an empty upload behind.
+	uploader, err := client.CreateUpload(upload)
+	for err != nil {
+		if stop := backoff(err); stop != nil {
+			return fmt.Errorf("failed to create upload: %w", stop)
+		}
+		p.retryIn = 0
+		report(p)
+		uploader, err = client.CreateUpload(upload)
+	}
+
+	p, failures = progress{url: uploader.Url()}, 0
 	for uploader.Offset() < upload.Size() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		p.offset, p.retryIn = uploader.Offset(), 0
 		report(p)
 
 		err := uploader.UploadChunck()
+		if err == nil && uploader.Offset() <= p.offset {
+			err = errNoProgress
+		}
 		if err == nil {
 			failures, p.err, p.attempt = 0, nil, 0
 			continue
@@ -78,17 +119,8 @@ func uploadFile(ctx context.Context, client *tus.Client, upload *tus.Upload, ret
 
 		// Keep retrying until the offset resync succeeds; the outer loop then resends from there.
 		for err != nil {
-			if !retryable(err) {
-				return err
-			}
-			failures++
-			if failures > retry.maxRetries {
-				return fmt.Errorf("gave up after %d retries: %w", retry.maxRetries, err)
-			}
-			p.err, p.attempt, p.retryIn = err, failures, retry.delay(failures)
-			report(p)
-			if err := sleep(ctx, p.retryIn); err != nil {
-				return err
+			if stop := backoff(err); stop != nil {
+				return stop
 			}
 
 			var resumed *tus.Uploader

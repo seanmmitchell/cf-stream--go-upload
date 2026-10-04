@@ -32,9 +32,12 @@ type patchOutcome struct {
 type fakeTUS struct {
 	mu      sync.Mutex
 	data    []byte
+	posts   int
 	patches int
 	heads   int
 	patch   func(n int) patchOutcome // Picks the outcome of PATCH number n (from 1). Nil means always succeed.
+	post    func(n int) int          // Status to fail POST number n with, or 0 to succeed. Nil means always succeed.
+	head    func(n int) int          // Status to fail HEAD number n with, or 0 to succeed. Nil means always succeed.
 }
 
 func (s *fakeTUS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -43,10 +46,19 @@ func (s *fakeTUS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodPost:
+		s.posts++
+		if s.post != nil && s.post(s.posts) != 0 {
+			w.WriteHeader(s.post(s.posts))
+			return
+		}
 		w.Header().Set("Location", "/files/1")
 		w.WriteHeader(http.StatusCreated)
 	case http.MethodHead:
 		s.heads++
+		if s.head != nil && s.head(s.heads) != 0 {
+			w.WriteHeader(s.head(s.heads))
+			return
+		}
 		w.Header().Set("Upload-Offset", strconv.Itoa(len(s.data)))
 		w.WriteHeader(http.StatusOK)
 	case http.MethodPatch:
@@ -230,6 +242,118 @@ func TestUploadFileStopsWhenCancelled(t *testing.T) {
 	}
 }
 
+func TestUploadFileStopsWhenCancelledBetweenChunks(t *testing.T) {
+	srv := &fakeTUS{}
+	client, upload := newTestUpload(t, srv, []byte("0123456789"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := uploadFile(ctx, client, upload, fastRetry, func(p progress) {
+		if p.offset == 4 {
+			cancel()
+		}
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("uploadFile err = %v, want %v", err, context.Canceled)
+	}
+	if srv.patches != 2 {
+		t.Errorf("sent %d PATCH requests, want 2", srv.patches)
+	}
+}
+
+func TestUploadFileRetriesWhenOffsetDoesNotAdvance(t *testing.T) {
+	// The server answers 204 but keeps none of the chunk.
+	srv := &fakeTUS{patch: func(int) patchOutcome { return patchOutcome{discard: true} }}
+	_, err := runUpload(t, srv, []byte("0123456789"))
+
+	if !errors.Is(err, errNoProgress) || !strings.Contains(err.Error(), "gave up after 3 retries") {
+		t.Fatalf("uploadFile err = %v, want it to give up with %v", err, errNoProgress)
+	}
+	if srv.patches != fastRetry.maxRetries+1 {
+		t.Errorf("sent %d PATCH requests, want %d", srv.patches, fastRetry.maxRetries+1)
+	}
+}
+
+func TestUploadFileRetriesCreate(t *testing.T) {
+	content := []byte("0123456789")
+	srv := &fakeTUS{post: func(n int) int {
+		if n <= 2 {
+			return http.StatusServiceUnavailable
+		}
+		return 0
+	}}
+	_, err := runUpload(t, srv, content)
+
+	if err != nil {
+		t.Fatalf("uploadFile: %v", err)
+	}
+	if !bytes.Equal(srv.data, content) || srv.posts != 3 {
+		t.Errorf("server has %q after %d POST requests, want %q after 3", srv.data, srv.posts, content)
+	}
+}
+
+func TestUploadFileRetriesFailedResync(t *testing.T) {
+	content := []byte("0123456789")
+	srv := &fakeTUS{
+		patch: func(n int) patchOutcome { return patchOutcome{hangup: n == 2} },
+		head: func(n int) int {
+			if n == 1 {
+				return http.StatusServiceUnavailable
+			}
+			return 0
+		},
+	}
+	_, err := runUpload(t, srv, content)
+
+	if err != nil {
+		t.Fatalf("uploadFile: %v", err)
+	}
+	if !bytes.Equal(srv.data, content) || srv.heads != 2 {
+		t.Errorf("server has %q after %d HEAD requests, want %q after 2", srv.data, srv.heads, content)
+	}
+}
+
+func TestUploadFileStopsWhenResyncFindsNoUpload(t *testing.T) {
+	srv := &fakeTUS{
+		patch: func(n int) patchOutcome { return patchOutcome{hangup: n == 2} },
+		head:  func(int) int { return http.StatusNotFound },
+	}
+	_, err := runUpload(t, srv, []byte("0123456789"))
+
+	if !errors.Is(err, tus.ErrUploadNotFound) {
+		t.Fatalf("uploadFile err = %v, want %v", err, tus.ErrUploadNotFound)
+	}
+	if srv.heads != 1 {
+		t.Errorf("sent %d HEAD requests, want 1", srv.heads)
+	}
+}
+
+func TestUploadFileCountsResyncFailuresTowardsRetries(t *testing.T) {
+	srv := &fakeTUS{
+		patch: func(n int) patchOutcome { return patchOutcome{hangup: n == 2} },
+		head:  func(int) int { return http.StatusServiceUnavailable },
+	}
+	_, err := runUpload(t, srv, []byte("0123456789"))
+
+	if err == nil || !strings.Contains(err.Error(), "gave up after 3 retries") {
+		t.Fatalf("uploadFile err = %v, want it to give up after 3 retries", err)
+	}
+	// One failed PATCH and two failed HEADs use 3 retries; the third HEAD failure is one too many.
+	if srv.patches != 2 || srv.heads != 3 {
+		t.Errorf("sent %d PATCH and %d HEAD requests, want 2 and 3", srv.patches, srv.heads)
+	}
+}
+
+func TestRetryableRejectsUntrustedCertificate(t *testing.T) {
+	ts := httptest.NewTLSServer(http.NotFoundHandler())
+	defer ts.Close()
+
+	_, err := http.Get(ts.URL)
+	if err == nil || retryable(err) {
+		t.Fatalf("retryable(%v) = true, want false", err)
+	}
+}
+
 func TestRetryable(t *testing.T) {
 	tests := []struct {
 		err  error
@@ -240,7 +364,10 @@ func TestRetryable(t *testing.T) {
 		{tus.ClientError{Code: http.StatusServiceUnavailable}, true},
 		{tus.ClientError{Code: http.StatusRequestTimeout}, true},
 		{tus.ClientError{Code: http.StatusTooManyRequests}, true},
+		{tus.ClientError{Code: http.StatusLocked}, true},
+		{errNoProgress, true},
 		{&url.Error{Op: "Patch", URL: "https://example.com", Err: io.ErrUnexpectedEOF}, true},
+		{&url.Error{Op: "parse", URL: "::", Err: errors.New("missing protocol scheme")}, false},
 		{tus.ClientError{Code: http.StatusUnauthorized}, false},
 		{tus.ClientError{Code: http.StatusForbidden}, false},
 		{tus.ErrLargeUpload, false},

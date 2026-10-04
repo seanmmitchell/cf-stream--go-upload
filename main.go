@@ -4,8 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
+	"os/signal"
+	"runtime/debug"
 	"strconv"
+	"syscall"
+	"time"
 
 	"github.com/eventials/go-tus"
 	"github.com/eventials/go-tus/memorystore"
@@ -125,6 +130,10 @@ func main() {
 		os.Exit(1)
 		return
 	}
+	if !fileInfo.Mode().IsRegular() {
+		le.Log(ale.Critical, fmt.Sprintf("File is not a regular file: %s", file))
+		os.Exit(1)
+	}
 	fileSize := fileInfo.Size()
 	f, err := os.Open(file)
 	if err != nil {
@@ -138,6 +147,10 @@ func main() {
 	// Resume keeps the upload URL in the store, so after a failed chunk the
 	// uploader can re-read the server's offset (ResumeUpload) before resending.
 	store, _ := memorystore.NewMemoryStore()
+	// go-tus never passes a context, so bound how long a request may wait for a
+	// reply once it is sent. A timeout is retried like any other network error.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 2 * time.Minute
 	config := &tus.Config{
 		ChunkSize:           chunkSize * 1024 * 1024,
 		Resume:              true,
@@ -146,7 +159,7 @@ func main() {
 		Header: map[string][]string{
 			"Authorization": {fmt.Sprintf("Bearer %s", apiToken)},
 		},
-		HttpClient: nil,
+		HttpClient: &http.Client{Transport: transport},
 	}
 
 	client, err := tus.NewClient(fmt.Sprintf(endpoint, accountID), config)
@@ -161,6 +174,10 @@ func main() {
 		os.Exit(1)
 	}
 	//#endregion TUS Client
+
+	// Catch signals before the terminal goes raw, so none can skip Fini.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 
 	// Set up the screen before the upload is created on the server, so a
 	// missing or unusable terminal stops here without leaving a partial upload.
@@ -179,8 +196,15 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	updates := make(chan progress)
 	done := make(chan error, 1)
+	retry := defaultRetry
 	go func() {
-		done <- uploadFile(ctx, client, upload, defaultRetry, func(p progress) {
+		// A panic here would skip runUI's Fini, so hand it to runUI as an error.
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("upload panicked: %v\n%s", r, debug.Stack())
+			}
+		}()
+		done <- uploadFile(ctx, client, upload, retry, func(p progress) {
 			select {
 			case updates <- p:
 			case <-ctx.Done():
@@ -188,8 +212,8 @@ func main() {
 		})
 	}()
 
-	v := view{accountID: accountID, fileName: f.Name(), fileSize: fileSize, maxRetries: defaultRetry.maxRetries}
-	last, err := runUI(screen, v, updates, done)
+	v := view{accountID: accountID, fileName: f.Name(), fileSize: fileSize, maxRetries: retry.maxRetries}
+	last, err := runUI(screen, v, updates, done, signals)
 	cancel()
 
 	switch {
@@ -198,6 +222,9 @@ func main() {
 	case errors.Is(err, errInterrupted):
 		le.Log(ale.Warning, fmt.Sprintf("Upload cancelled after %d of %d bytes.", last.offset, fileSize))
 		os.Exit(130)
+	case errors.Is(err, errTerminated):
+		le.Log(ale.Warning, fmt.Sprintf("Upload terminated after %d of %d bytes.", last.offset, fileSize))
+		os.Exit(143)
 	default:
 		le.Log(ale.Critical, fmt.Sprintf("Upload failed after %d of %d bytes. Err: %s", last.offset, fileSize, err))
 		os.Exit(1)

@@ -2,7 +2,9 @@ package main
 
 import (
 	"errors"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -43,7 +45,7 @@ func TestRunUIReturnsWhenUploadFinishes(t *testing.T) {
 		done <- nil
 	}()
 
-	last, err := runUI(screen, view{fileSize: 10}, updates, done)
+	last, err := runUI(screen, view{fileSize: 10}, updates, done, nil)
 	if err != nil || last.offset != 10 {
 		t.Fatalf("runUI = %+v, %v, want offset 10 and no error", last, err)
 	}
@@ -58,7 +60,7 @@ func TestRunUIReturnsUploadError(t *testing.T) {
 	done := make(chan error, 1)
 	done <- failed
 
-	if _, err := runUI(screen, view{}, nil, done); !errors.Is(err, failed) {
+	if _, err := runUI(screen, view{}, nil, done, nil); !errors.Is(err, failed) {
 		t.Fatalf("runUI err = %v, want %v", err, failed)
 	}
 }
@@ -68,11 +70,29 @@ func TestRunUIStopsOnCtrlC(t *testing.T) {
 	screen.InjectKey(tcell.KeyCtrlC, 0, tcell.ModCtrl)
 
 	// The upload never finishes, so only Ctrl-C can end runUI.
-	if _, err := runUI(screen, view{}, nil, nil); !errors.Is(err, errInterrupted) {
+	if _, err := runUI(screen, view{}, nil, nil, nil); !errors.Is(err, errInterrupted) {
 		t.Fatalf("runUI err = %v, want %v", err, errInterrupted)
 	}
 	if _, width, _ := screen.GetContents(); width != 0 {
 		t.Error("screen was not finalized")
+	}
+}
+
+func TestRunUIMapsSignals(t *testing.T) {
+	tests := []struct {
+		sig  os.Signal
+		want error
+	}{
+		{os.Interrupt, errInterrupted},
+		{syscall.SIGTERM, errTerminated},
+	}
+	for _, tt := range tests {
+		screen := newSimScreen(t)
+		signals := make(chan os.Signal, 1)
+		signals <- tt.sig
+		if _, err := runUI(screen, view{}, nil, nil, signals); !errors.Is(err, tt.want) {
+			t.Errorf("runUI after %v: err = %v, want %v", tt.sig, err, tt.want)
+		}
 	}
 }
 
@@ -87,6 +107,7 @@ func TestDrawProgress(t *testing.T) {
 		{"uploading", progress{url: "u", offset: 50}, []string{"Bytes Uploaded: 50 (25%)", "Total File Size: 200", "Status: Uploading..."}},
 		{"waiting", progress{url: "u", err: errors.New("boom"), attempt: 2, retryIn: 4 * time.Second}, []string{"Status: Retrying in 4s (attempt 2 of 8). Err: boom"}},
 		{"retrying", progress{url: "u", err: errors.New("boom"), attempt: 2}, []string{"Status: Retrying (attempt 2 of 8). Err: boom"}},
+		{"retrying create", progress{err: errors.New("boom"), attempt: 1, retryIn: time.Second}, []string{"Status: Retrying in 1s (attempt 1 of 8). Err: boom"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
