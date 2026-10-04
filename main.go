@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"log"
 	"os"
 	"strconv"
 
 	"github.com/eventials/go-tus"
+	"github.com/eventials/go-tus/memorystore"
 	"github.com/gdamore/tcell/v2"
 	"github.com/seanmmitchell/ale/v2"
 	"github.com/seanmmitchell/ale/v2/pconsole"
@@ -79,14 +81,22 @@ func main() {
 	}
 	apiToken, apiTokenIDErr := pattern.Get("apitoken")
 	if apiTokenIDErr != nil {
-		le.Log(ale.Critical, fmt.Sprintf("Failed to get API Token from Transporter Pattern. Err: %s", acctIDErr))
+		le.Log(ale.Critical, fmt.Sprintf("Failed to get API Token from Transporter Pattern. Err: %s", apiTokenIDErr))
 		os.Exit(1)
+	}
+
+	// A token passed as a flag is visible in ps and shell history for as long as the upload runs.
+	for _, arg := range os.Args[1:] {
+		if arg == "--token" || arg == "--apitoken" {
+			le.Log(ale.Warning, "The API token was passed on the command line, where it shows up in ps and shell history. Set the T_apitoken environment variable instead.")
+			break
+		}
 	}
 
 	// Chunk Size for TUS Upload
 	chunkSizeStr, chunkSizeStrErr := pattern.Get("chunksize")
 	if chunkSizeStrErr != nil {
-		le.Log(ale.Critical, fmt.Sprintf("Failed to get Chunk Size from Transporter Pattern. Err: %s", acctIDErr))
+		le.Log(ale.Critical, fmt.Sprintf("Failed to get Chunk Size from Transporter Pattern. Err: %s", chunkSizeStrErr))
 		os.Exit(1)
 	}
 	chunkSizeInt, chunkSizeConvErr := strconv.Atoi(chunkSizeStr)
@@ -124,98 +134,72 @@ func main() {
 	defer f.Close()
 	//#endregion Transporter / Inputs / Parsing
 
-	screen, err0 := tcell.NewScreen()
-	if err0 != nil {
-		fmt.Print(err0)
-	}
-
-	err1 := screen.Init()
-	if err1 != nil {
-		fmt.Print(err1)
-	}
-
-	screenW, _ := screen.Size()
-
+	//#region TUS Client
+	// Resume keeps the upload URL in the store, so after a failed chunk the
+	// uploader can re-read the server's offset (ResumeUpload) before resending.
+	store, _ := memorystore.NewMemoryStore()
 	config := &tus.Config{
 		ChunkSize:           chunkSize * 1024 * 1024,
-		Resume:              false,
+		Resume:              true,
 		OverridePatchMethod: false,
-		Store:               nil,
+		Store:               store,
 		Header: map[string][]string{
 			"Authorization": {fmt.Sprintf("Bearer %s", apiToken)},
 		},
 		HttpClient: nil,
 	}
 
-	clientURL := fmt.Sprintf(endpoint, accountID)
-	fmt.Println(clientURL)
-	client, err := tus.NewClient(clientURL, config)
+	client, err := tus.NewClient(fmt.Sprintf(endpoint, accountID), config)
 	if err != nil {
-		log.Fatalf("Failed to create TUS client: %v", err)
+		le.Log(ale.Critical, fmt.Sprintf("Failed to create TUS client. Err: %s", err))
+		os.Exit(1)
 	}
 
 	upload, err := tus.NewUploadFromFile(f)
 	if err != nil {
-		log.Fatalf("Failed to create upload from file: %v", err)
+		le.Log(ale.Critical, fmt.Sprintf("Failed to create upload from file. Err: %s", err))
+		os.Exit(1)
 	}
+	//#endregion TUS Client
 
-	uploader, err := client.CreateUpload(upload)
+	// Set up the screen before the upload is created on the server, so a
+	// missing or unusable terminal stops here without leaving a partial upload.
+	screen, err := tcell.NewScreen()
 	if err != nil {
-		log.Fatalf("Failed to create upload: %v", err)
+		le.Log(ale.Critical, fmt.Sprintf("Failed to open the terminal screen. Err: %s", err))
+		os.Exit(1)
+	}
+	if err := screen.Init(); err != nil {
+		le.Log(ale.Critical, fmt.Sprintf("Failed to initialize the terminal screen. Err: %s", err))
+		os.Exit(1)
 	}
 
+	// The worker owns the upload and only reports progress. runUI owns the
+	// screen and restores the terminal before it returns.
+	ctx, cancel := context.WithCancel(context.Background())
+	updates := make(chan progress)
+	done := make(chan error, 1)
 	go func() {
-		for {
-			ev := screen.PollEvent()
-			switch ev := ev.(type) {
-			case *tcell.EventKey:
-				modifier, key, _ := ev.Modifiers(), ev.Key(), ev.Rune()
-				//logEngine.Log(logEngine.CreateLogNow(ale.Debug, "",fmt.Sprintf("Mods: %f| Key: %f| Rune: %f", modifier, key, char)))
-				if modifier == 2 && key == 3 {
-					// Control C | Terminate
-					screen.Clear()
-					screen.Sync()
-					screen.Fini()
-					//logEngine.Log(logEngine.CreateLogNow(ale.Debug, "","Detected Ctrl-C. Exiting TC..."))
-					os.Exit(1)
-				}
+		done <- uploadFile(ctx, client, upload, defaultRetry, func(p progress) {
+			select {
+			case updates <- p:
+			case <-ctx.Done():
 			}
-		}
+		})
 	}()
 
-	x := 0
-	for {
-		// Take Event or Render / Display
+	v := view{accountID: accountID, fileName: f.Name(), fileSize: fileSize, maxRetries: defaultRetry.maxRetries}
+	last, err := runUI(screen, v, updates, done)
+	cancel()
 
-		// Clear screen
-		// screen.Clear()
-		x += 1
-		tCellDraw(screen, 15, 11, 20, 11, tcell.StyleDefault, fmt.Sprint(x))
-		// Boundaries
-		tCellDraw(screen, 0, 1, screenW, 1, tcell.StyleDefault, getChars("~", screenW))
-
-		// Text
-		line := fmt.Sprintf("Account ID: %s", accountID)
-		tCellDraw(screen, 0, 0, len(line), 0, tcell.StyleDefault, line)
-
-		// Progress
-		line = fmt.Sprintf("\t ==> File: %s", f.Name())
-		tCellDraw(screen, 0, 3, len(line), 3, tcell.StyleDefault, line)
-
-		offset := uploader.Offset()
-		line = fmt.Sprintf("\t\t || Bytes Uploaded? Offset: %d", offset)
-		tCellDraw(screen, 0, 4, len(line), 4, tcell.StyleDefault, line)
-		line = fmt.Sprintf("\t\t || Total File Size: %d", fileSize)
-		tCellDraw(screen, 0, 5, len(line), 5, tcell.StyleDefault, line)
-
-		err := uploader.UploadChunck()
-		line = fmt.Sprintf("Errors: %s", err)
-		tCellDraw(screen, 0, 12, len(line), 12, tcell.StyleDefault, line)
-
-		// Display
-		screen.Show()
-
-		//time.Sleep(time.Millisecond * 16)
-
+	switch {
+	case err == nil:
+		le.Log(ale.Info, fmt.Sprintf("Upload complete. %d bytes sent to %s", last.offset, last.url))
+	case errors.Is(err, errInterrupted):
+		le.Log(ale.Warning, fmt.Sprintf("Upload cancelled after %d of %d bytes.", last.offset, fileSize))
+		os.Exit(130)
+	default:
+		le.Log(ale.Critical, fmt.Sprintf("Upload failed after %d of %d bytes. Err: %s", last.offset, fileSize, err))
+		os.Exit(1)
 	}
 }
