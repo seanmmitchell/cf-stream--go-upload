@@ -227,6 +227,10 @@ func main() {
 	}
 	fileSize := upload.Size()
 
+	if tokenFromFlag() {
+		fmt.Fprintln(os.Stderr, "Warning: the API token was passed as a flag, so other users can see it (e.g. in ps) and your shell may save it in its history. Prefer the T_apitoken environment variable.")
+	}
+
 	// Registered before the screen is set up so a signal can't skip restoring the terminal.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
@@ -460,6 +464,16 @@ func videoID(uploadURL string) string {
 		return "unknown"
 	}
 	return id
+}
+
+// tokenFromFlag reports whether the API token was passed on the command line.
+func tokenFromFlag() bool {
+	for _, arg := range os.Args[1:] {
+		if arg == "--apitoken" || arg == "--token" {
+			return true
+		}
+	}
+	return false
 }
 
 // draw renders the upload status. Only the main goroutine may call it.
