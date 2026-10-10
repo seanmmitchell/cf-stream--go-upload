@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/eventials/go-tus"
 )
@@ -51,7 +52,18 @@ var (
 	errNoProgress = errors.New("server did not advance the upload offset")
 	// errStalled means a request body stopped being sent (see stallGuard).
 	errStalled = errors.New("upload stalled: no data sent")
+	// errBadOffset means the server reported an offset outside the file.
+	errBadOffset = errors.New("server reported an impossible upload offset")
 )
+
+// checkOffset fails with errBadOffset unless 0 <= offset <= size. Without it,
+// an offset past the end of the file would end the upload as if it were complete.
+func checkOffset(offset, size int64) error {
+	if offset < 0 || offset > size {
+		return fmt.Errorf("%w: %d for a %d-byte file", errBadOffset, offset, size)
+	}
+	return nil
+}
 
 // retryable reports whether err may clear up on its own: a server error, rate
 // limiting, a locked upload, an offset mismatch (which a resync fixes), or a
@@ -98,6 +110,21 @@ func describe(err error) string {
 		body = strings.ToValidUTF8(body[:300], "") + "..."
 	}
 	return fmt.Sprintf("%s: %s", err, body)
+}
+
+// printable makes text that may come from the server safe to show in a
+// terminal: invalid UTF-8 and control characters (C0, DEL and C1, which can
+// start escape sequences) are dropped, and line breaks and tabs become spaces.
+func printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			return ' '
+		case unicode.IsControl(r):
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(s, ""))
 }
 
 // newHTTPClient returns the client go-tus uses. stallGuard gives requests ctx
@@ -248,6 +275,9 @@ func uploadFile(ctx context.Context, client *tus.Client, upload *tus.Upload, ret
 			err = errNoProgress
 		}
 		if err == nil {
+			if err := checkOffset(uploader.Offset(), upload.Size()); err != nil {
+				return err
+			}
 			failures, p.err, p.attempt = 0, nil, 0
 			continue
 		}
@@ -262,6 +292,14 @@ func uploadFile(ctx context.Context, client *tus.Client, upload *tus.Upload, ret
 			if resumed, err = client.ResumeUpload(upload); err == nil {
 				uploader = resumed
 			}
+		}
+		if err := checkOffset(uploader.Offset(), upload.Size()); err != nil {
+			return err
+		}
+		// The server stored data although the reply was lost, so the upload is
+		// still moving: count retries afresh, as after a successful chunk.
+		if uploader.Offset() > p.offset {
+			failures, p.err, p.attempt = 0, nil, 0
 		}
 	}
 

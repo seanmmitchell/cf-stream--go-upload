@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/eventials/go-tus"
@@ -22,6 +24,30 @@ const (
 	endpoint = "https://api.cloudflare.com/client/v4/accounts/%s/stream"
 )
 
+// tokenFlags are the command-line flags that set the API token.
+var tokenFlags = []string{"apitoken", "token"}
+
+// tokenArgs reports whether args pass the API token as a flag, and whether
+// any uses the --token=VALUE form. transporter reads any argument starting
+// with "-" as the flag named by everything after its first two characters, so
+// "-xtoken VALUE" sets the token too. It does not split "name=value", and
+// prints such an argument, token included, as an unknown flag.
+func tokenArgs(args []string) (asFlag, inline bool) {
+	for i := 0; i < len(args); i++ {
+		if len(args[i]) < 2 || args[i][0] != '-' {
+			continue
+		}
+		name := args[i][2:]
+		if slices.Contains(tokenFlags, name) {
+			asFlag = true
+			i++ // Skip the value, which may itself start with "-".
+		} else if before, _, ok := strings.Cut(name, "="); ok && slices.Contains(tokenFlags, before) {
+			inline = true
+		}
+	}
+	return asFlag, inline
+}
+
 func main() {
 	le := ale.CreateLogEngine("Cloudflare Stream - Go Uploader")
 	pCTX, _ := pconsole.New(50, 20)
@@ -29,6 +55,13 @@ func main() {
 
 	tle := le.CreateSubEngine("Transporter")
 	tle.AddLogPipeline(ale.Info, pCTX.Log)
+
+	// Checked before transporter parses the arguments, since it would print an inline token.
+	tokenAsFlag, tokenInline := tokenArgs(os.Args[1:])
+	if tokenInline {
+		le.Log(ale.Critical, "The API token can't be passed as --token=VALUE. Set the T_apitoken environment variable instead.")
+		os.Exit(1)
+	}
 
 	//#region Transporter / Inputs / Parsing
 	pattern, err2 := transporter.Energize(
@@ -43,7 +76,7 @@ func main() {
 				"apitoken": {
 					Name:               "API Token",
 					Description:        "",
-					CLIFlags:           []string{"apitoken", "token"},
+					CLIFlags:           tokenFlags,
 					ENVVars:            []string{"apitoken"},
 					DisablePersistence: true,
 				},
@@ -74,12 +107,17 @@ func main() {
 	)
 	if err2 != nil {
 		le.Log(ale.Critical, fmt.Sprintf("Transporter pattern failed to energize. Err: %s", err2))
+		os.Exit(1)
 	}
 
-	// Get details from Transporter like Account ID and API Token
+	// Get details from Transporter like Account ID and API Token. Unset values come back empty.
 	accountID, acctIDErr := pattern.Get("acctid")
 	if acctIDErr != nil {
 		le.Log(ale.Critical, fmt.Sprintf("Failed to get Account ID from Transporter Pattern. Err: %s", acctIDErr))
+		os.Exit(1)
+	}
+	if strings.TrimSpace(accountID) == "" {
+		le.Log(ale.Critical, "No Account ID was provided. Use --acctid or the T_acctid environment variable.")
 		os.Exit(1)
 	}
 	apiToken, apiTokenIDErr := pattern.Get("apitoken")
@@ -87,13 +125,14 @@ func main() {
 		le.Log(ale.Critical, fmt.Sprintf("Failed to get API Token from Transporter Pattern. Err: %s", apiTokenIDErr))
 		os.Exit(1)
 	}
+	if strings.TrimSpace(apiToken) == "" {
+		le.Log(ale.Critical, "No API Token was provided. Set the T_apitoken environment variable.")
+		os.Exit(1)
+	}
 
 	// A token passed as a flag is visible in ps and shell history for as long as the upload runs.
-	for _, arg := range os.Args[1:] {
-		if arg == "--token" || arg == "--apitoken" {
-			le.Log(ale.Warning, "The API token was passed on the command line, where it shows up in ps and shell history. Set the T_apitoken environment variable instead.")
-			break
-		}
+	if tokenAsFlag {
+		le.Log(ale.Warning, "The API token was passed on the command line, where it shows up in ps and shell history. Set the T_apitoken environment variable instead.")
 	}
 
 	// Chunk Size for TUS Upload
@@ -122,6 +161,10 @@ func main() {
 		le.Log(ale.Critical, fmt.Sprintf("Failed to get File from Transporter Pattern. Err: %s", fileErr))
 		os.Exit(1)
 	}
+	if strings.TrimSpace(file) == "" {
+		le.Log(ale.Critical, "No File was provided. Use --file or the T_file environment variable.")
+		os.Exit(1)
+	}
 	fileInfo, err := os.Stat(file)
 	if err != nil {
 		le.Log(ale.Critical, fmt.Sprintf("Failed to get file details. Err: %s", err))
@@ -131,6 +174,10 @@ func main() {
 	// Not !IsRegular(): on Windows that also rejects OneDrive and other reparse-point files.
 	if fileInfo.Mode()&(os.ModeDir|os.ModeNamedPipe|os.ModeSocket|os.ModeDevice|os.ModeCharDevice) != 0 {
 		le.Log(ale.Critical, fmt.Sprintf("File must be a regular file, not a directory, pipe, socket or device: %s", file))
+		os.Exit(1)
+	}
+	if fileInfo.Size() == 0 {
+		le.Log(ale.Critical, fmt.Sprintf("File is empty: %s", file))
 		os.Exit(1)
 	}
 	fileSize := fileInfo.Size()
@@ -184,6 +231,8 @@ func main() {
 		le.Log(ale.Critical, fmt.Sprintf("Failed to open the terminal screen. Err: %s", err))
 		os.Exit(1)
 	}
+	// Saved so the terminal can be restored even if tcell's Fini hangs.
+	saved := saveTerminal()
 	if err := screen.Init(); err != nil {
 		le.Log(ale.Critical, fmt.Sprintf("Failed to initialize the terminal screen. Err: %s", err))
 		os.Exit(1)
@@ -210,7 +259,7 @@ func main() {
 	}()
 
 	v := view{accountID: accountID, fileName: f.Name(), fileSize: fileSize, maxRetries: retry.maxRetries}
-	last, err := runUI(screen, v, updates, done, signals)
+	last, err := runUI(screen, v, updates, done, signals, saved.restore)
 	cancel()
 
 	// Name the partial upload, so it can be found and deleted in the dashboard.
@@ -218,18 +267,20 @@ func main() {
 	if last.url != "" {
 		partial = fmt.Sprintf(" Partial upload: %s", last.url)
 	}
+	// The messages carry text from the server (URL, error, reply body), so
+	// they go through printable.
 	var stop stopSignal
 	switch {
 	case err == nil:
-		le.Log(ale.Info, fmt.Sprintf("Upload complete. %d bytes sent to %s", last.offset, last.url))
+		le.Log(ale.Info, printable(fmt.Sprintf("Upload complete. %d bytes sent to %s", last.offset, last.url)))
 	case errors.Is(err, errInterrupted):
-		le.Log(ale.Warning, fmt.Sprintf("Upload cancelled after %d of %d bytes.%s", last.offset, fileSize, partial))
+		le.Log(ale.Warning, printable(fmt.Sprintf("Upload cancelled after %d of %d bytes.%s", last.offset, fileSize, partial)))
 		os.Exit(130)
 	case errors.As(err, &stop):
-		le.Log(ale.Warning, fmt.Sprintf("Upload stopped by signal (%s) after %d of %d bytes.%s", stop.sig, last.offset, fileSize, partial))
+		le.Log(ale.Warning, printable(fmt.Sprintf("Upload stopped by signal (%s) after %d of %d bytes.%s", stop.sig, last.offset, fileSize, partial)))
 		os.Exit(128 + int(stop.sig))
 	default:
-		le.Log(ale.Critical, fmt.Sprintf("Upload failed after %d of %d bytes.%s Err: %s", last.offset, fileSize, partial, describe(err)))
+		le.Log(ale.Critical, printable(fmt.Sprintf("Upload failed after %d of %d bytes.%s Err: %s", last.offset, fileSize, partial, describe(err))))
 		os.Exit(1)
 	}
 }

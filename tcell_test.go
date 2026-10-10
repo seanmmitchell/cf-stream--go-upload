@@ -45,7 +45,7 @@ func TestRunUIReturnsWhenUploadFinishes(t *testing.T) {
 		done <- nil
 	}()
 
-	last, err := runUI(screen, view{fileSize: 10}, updates, done, nil)
+	last, err := runUI(screen, view{fileSize: 10}, updates, done, nil, nil)
 	if err != nil || last.offset != 10 {
 		t.Fatalf("runUI = %+v, %v, want offset 10 and no error", last, err)
 	}
@@ -60,7 +60,7 @@ func TestRunUIReturnsUploadError(t *testing.T) {
 	done := make(chan error, 1)
 	done <- failed
 
-	if _, err := runUI(screen, view{}, nil, done, nil); !errors.Is(err, failed) {
+	if _, err := runUI(screen, view{}, nil, done, nil, nil); !errors.Is(err, failed) {
 		t.Fatalf("runUI err = %v, want %v", err, failed)
 	}
 }
@@ -70,9 +70,65 @@ func TestRunUIStopsOnCtrlC(t *testing.T) {
 	screen.InjectKey(tcell.KeyCtrlC, 0, tcell.ModCtrl)
 
 	// The upload never finishes, so only Ctrl-C can end runUI.
-	if _, err := runUI(screen, view{}, nil, nil, nil); !errors.Is(err, errInterrupted) {
+	if _, err := runUI(screen, view{}, nil, nil, nil, nil); !errors.Is(err, errInterrupted) {
 		t.Fatalf("runUI err = %v, want %v", err, errInterrupted)
 	}
+	if _, width, _ := screen.GetContents(); width != 0 {
+		t.Error("screen was not finalized")
+	}
+}
+
+// countingScreen counts how often the screen is shown.
+type countingScreen struct {
+	tcell.SimulationScreen
+	shows int
+}
+
+func (s *countingScreen) Show() {
+	s.shows++
+	s.SimulationScreen.Show()
+}
+
+func TestRunUIIgnoresKeysWithoutRedrawing(t *testing.T) {
+	screen := &countingScreen{SimulationScreen: newSimScreen(t)}
+	for _, r := range "abcde" {
+		screen.InjectKey(tcell.KeyRune, r, tcell.ModNone)
+	}
+	screen.InjectKey(tcell.KeyCtrlC, 0, tcell.ModCtrl)
+
+	if _, err := runUI(screen, view{}, nil, nil, nil, nil); !errors.Is(err, errInterrupted) {
+		t.Fatalf("runUI err = %v, want %v", err, errInterrupted)
+	}
+	// Only the first frame: redrawing for every key lets a paste back up tcell's input.
+	if screen.shows != 1 {
+		t.Errorf("screen shown %d times, want 1", screen.shows)
+	}
+}
+
+// hangingScreen is a screen whose Fini blocks until release is closed, like
+// tcell's when its input goroutine is stuck.
+type hangingScreen struct {
+	tcell.SimulationScreen
+	release chan struct{}
+}
+
+func (s hangingScreen) Fini() { <-s.release }
+
+func TestFinishFallsBackWhenFiniHangs(t *testing.T) {
+	screen := hangingScreen{newSimScreen(t), make(chan struct{})}
+	defer close(screen.release)
+
+	restored := false
+	finish(screen, 10*time.Millisecond, func() { restored = true })
+	if !restored {
+		t.Error("fallback not called after Fini hung")
+	}
+}
+
+func TestFinishUsesFini(t *testing.T) {
+	screen := newSimScreen(t)
+
+	finish(screen, time.Hour, func() { t.Error("fallback called although Fini returned") })
 	if _, width, _ := screen.GetContents(); width != 0 {
 		t.Error("screen was not finalized")
 	}
@@ -91,7 +147,7 @@ func TestRunUIMapsSignals(t *testing.T) {
 		screen := newSimScreen(t)
 		signals := make(chan os.Signal, 1)
 		signals <- tt.sig
-		if _, err := runUI(screen, view{}, nil, nil, signals); err != tt.want {
+		if _, err := runUI(screen, view{}, nil, nil, signals, nil); err != tt.want {
 			t.Errorf("runUI after %v: err = %v, want %v", tt.sig, err, tt.want)
 		}
 	}

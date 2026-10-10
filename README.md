@@ -10,9 +10,9 @@ read -rs T_apitoken && export T_apitoken   # bash/zsh: prompts for the token wit
 On Windows, set the token with `$env:T_apitoken = Read-Host -MaskInput` (PowerShell 7.1+), then run `.\cfsgo.exe` with the same flags from PowerShell or Windows Terminal.
 
 - Chunk Size should be between 5-200 (MB)
-- Pass the API token in the `T_apitoken` environment variable. `--token [api-token]` still works, but command-line arguments show up in `ps` and shell history.
+- Pass the API token in the `T_apitoken` environment variable. `--token [api-token]` still works, but command-line arguments show up in `ps` and shell history. The `--token=[api-token]` form is rejected.
 - Every option can be set with a `T_` environment variable: `T_apitoken`, `T_acctid`, `T_file`, `T_chunksize`.
-- A failed request is retried up to 15 times with exponential backoff (1s, doubling up to 60s; about 10 minutes in all); a failed chunk is resent from the server's offset. A chunk that stops sending for a minute counts as failed. Errors that retrying cannot fix, such as a bad token (401/403), an upload that is too large (413) or an untrusted TLS certificate, stop the upload at once.
+- A failed request is retried up to 15 times in a row with exponential backoff (1s, doubling up to 60s; about 10 minutes in all); a failed chunk is resent from the server's offset, and the count starts over whenever the server has received more of the file. A chunk that stops sending for a minute counts as failed. Errors that retrying cannot fix, such as a bad token (401/403), an upload that is too large (413) or an untrusted TLS certificate, stop the upload at once.
 - Press Ctrl-C to cancel. The tool exits with 0 when the upload completes, 1 when it fails, 130 when cancelled with Ctrl-C, and 128 + the signal number on SIGTERM (143) or SIGHUP (129). A failed or cancelled run prints the partial upload's URL so it can be found and deleted.
 
 ## Releases

@@ -27,21 +27,23 @@ var fastRetry = retryPolicy{maxRetries: 3, baseDelay: time.Millisecond, maxDelay
 // patchOutcome says how fakeTUS answers a PATCH. The zero value stores the
 // chunk and replies 204.
 type patchOutcome struct {
-	discard bool // Drop the chunk instead of storing it.
-	status  int  // Reply with this status instead of 204.
-	hangup  bool // Close the connection instead of replying.
+	discard    bool // Drop the chunk instead of storing it.
+	status     int  // Reply with this status instead of 204.
+	hangup     bool // Close the connection instead of replying.
+	overreport int  // Reply with an offset this many bytes past what is stored.
 }
 
 // fakeTUS is a minimal TUS server for one upload.
 type fakeTUS struct {
-	mu      sync.Mutex
-	data    []byte
-	posts   int
-	patches int
-	heads   int
-	patch   func(n int) patchOutcome // Picks the outcome of PATCH number n (from 1). Nil means always succeed.
-	post    func(n int) int          // Status to fail POST number n with, or 0 to succeed. Nil means always succeed.
-	head    func(n int) int          // Status to fail HEAD number n with, or 0 to succeed. Nil means always succeed.
+	mu        sync.Mutex
+	data      []byte
+	posts     int
+	patches   int
+	heads     int
+	patch     func(n int) patchOutcome // Picks the outcome of PATCH number n (from 1). Nil means always succeed.
+	post      func(n int) int          // Status to fail POST number n with, or 0 to succeed. Nil means always succeed.
+	head      func(n int) int          // Status to fail HEAD number n with, or 0 to succeed. Nil means always succeed.
+	headExtra int                      // HEAD reports an offset this many bytes past what is stored.
 }
 
 func (s *fakeTUS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -63,7 +65,7 @@ func (s *fakeTUS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(s.head(s.heads))
 			return
 		}
-		w.Header().Set("Upload-Offset", strconv.Itoa(len(s.data)))
+		w.Header().Set("Upload-Offset", strconv.Itoa(len(s.data)+s.headExtra))
 		w.WriteHeader(http.StatusOK)
 	case http.MethodPatch:
 		s.patches++
@@ -87,7 +89,7 @@ func (s *fakeTUS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case out.status != 0:
 			w.WriteHeader(out.status)
 		default:
-			w.Header().Set("Upload-Offset", strconv.Itoa(len(s.data)))
+			w.Header().Set("Upload-Offset", strconv.Itoa(len(s.data)+out.overreport))
 			w.WriteHeader(http.StatusNoContent)
 		}
 	}
@@ -368,6 +370,66 @@ func TestUploadFileCountsResyncFailuresTowardsRetries(t *testing.T) {
 	// One failed PATCH and two failed HEADs use 3 retries; the third HEAD failure is one too many.
 	if srv.patches != 2 || srv.heads != 3 {
 		t.Errorf("sent %d PATCH and %d HEAD requests, want 2 and 3", srv.patches, srv.heads)
+	}
+}
+
+func TestUploadFileResetsRetriesWhenResyncShowsProgress(t *testing.T) {
+	content := []byte("01234567890123456789")
+	// Every chunk is stored but every reply is lost: 5 failures, more than
+	// fastRetry allows in a row, but each resync finds the server further on.
+	srv := &fakeTUS{patch: func(int) patchOutcome { return patchOutcome{hangup: true} }}
+	_, err := runUpload(t, srv, content)
+
+	if err != nil {
+		t.Fatalf("uploadFile: %v", err)
+	}
+	if !bytes.Equal(srv.data, content) || srv.patches != 5 || srv.heads != 5 {
+		t.Errorf("server has %q after %d PATCH and %d HEAD requests, want %q after 5 and 5", srv.data, srv.patches, srv.heads, content)
+	}
+}
+
+func TestUploadFileStopsWhenChunkReplyOffsetIsPastEnd(t *testing.T) {
+	srv := &fakeTUS{patch: func(int) patchOutcome { return patchOutcome{overreport: 100} }}
+	_, err := runUpload(t, srv, []byte("0123456789"))
+
+	if !errors.Is(err, errBadOffset) {
+		t.Fatalf("uploadFile err = %v, want %v", err, errBadOffset)
+	}
+	if srv.patches != 1 {
+		t.Errorf("sent %d PATCH requests, want 1", srv.patches)
+	}
+}
+
+func TestUploadFileStopsWhenResyncOffsetIsPastEnd(t *testing.T) {
+	srv := &fakeTUS{
+		patch:     func(n int) patchOutcome { return patchOutcome{hangup: n == 2} },
+		headExtra: 100,
+	}
+	_, err := runUpload(t, srv, []byte("0123456789"))
+
+	if !errors.Is(err, errBadOffset) {
+		t.Fatalf("uploadFile err = %v, want %v", err, errBadOffset)
+	}
+	if srv.heads != 1 || srv.patches != 2 {
+		t.Errorf("sent %d HEAD and %d PATCH requests, want 1 and 2", srv.heads, srv.patches)
+	}
+}
+
+func TestCheckOffset(t *testing.T) {
+	for _, tt := range []struct {
+		offset int64
+		ok     bool
+	}{{-1, false}, {0, true}, {10, true}, {11, false}} {
+		if err := checkOffset(tt.offset, 10); (err == nil) != tt.ok || (err != nil && retryable(err)) {
+			t.Errorf("checkOffset(%d, 10) = %v, want ok %v and a permanent error otherwise", tt.offset, err, tt.ok)
+		}
+	}
+}
+
+func TestPrintable(t *testing.T) {
+	in := "a\x1b]0;x\x07b\nc\td\u009bq\xff\x7fz é"
+	if got, want := printable(in), "a]0;xb c dqz é"; got != want {
+		t.Errorf("printable(%q) = %q, want %q", in, got, want)
 	}
 }
 
