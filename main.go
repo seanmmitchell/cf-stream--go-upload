@@ -27,25 +27,45 @@ const (
 // tokenFlags are the command-line flags that set the API token.
 var tokenFlags = []string{"apitoken", "token"}
 
-// tokenArgs reports whether args pass the API token as a flag, and whether
-// any uses the --token=VALUE form. transporter reads any argument starting
-// with "-" as the flag named by everything after its first two characters, so
-// "-xtoken VALUE" sets the token too. It does not split "name=value", and
-// prints such an argument, token included, as an unknown flag.
-func tokenArgs(args []string) (asFlag, inline bool) {
-	for i := 0; i < len(args); i++ {
-		if len(args[i]) < 2 || args[i][0] != '-' {
-			continue
-		}
-		name := args[i][2:]
-		if slices.Contains(tokenFlags, name) {
-			asFlag = true
-			i++ // Skip the value, which may itself start with "-".
-		} else if before, _, ok := strings.Cut(name, "="); ok && slices.Contains(tokenFlags, before) {
-			inline = true
-		}
+// flagHelp follows checkArgs's errors.
+const flagHelp = "Use --acctid, --file and --chunksize, each followed by its value (not --name=value), and pass the API token in T_apitoken. Arguments aren't printed, since one may be the token."
+
+// flagNames returns every name transporter accepts as a flag for p: a
+// sequence's key, its CLI flags and its environment variable names all match.
+func flagNames(p transporter.Pattern) []string {
+	var names []string
+	for key, seq := range p.Sequences {
+		names = append(names, key)
+		names = append(names, seq.CLIFlags...)
+		names = append(names, seq.ENVVars...)
 	}
-	return asFlag, inline
+	return names
+}
+
+// checkArgs checks args the way transporter reads them, so that transporter
+// never warns about one: it prints any argument it doesn't recognize, and
+// that may be the API token. transporter takes any argument starting with "-"
+// as the flag named by everything after its first two characters ("-xfile" is
+// --file), followed by its value, and never splits "name=value". checkArgs's
+// errors don't include argument text. It also reports whether the token was
+// passed as a flag.
+func checkArgs(args, names []string) (tokenAsFlag bool, err error) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if len(arg) < 2 || arg[0] != '-' {
+			return false, fmt.Errorf("argument %d is not a flag. %s", i+1, flagHelp)
+		}
+		name := arg[2:]
+		if !slices.Contains(names, name) {
+			return false, fmt.Errorf("argument %d is not a known flag. %s", i+1, flagHelp)
+		}
+		if i+1 == len(args) {
+			return false, fmt.Errorf("flag --%s needs a value", name)
+		}
+		tokenAsFlag = tokenAsFlag || slices.Contains(tokenFlags, name)
+		i++ // The value, which may itself start with "-".
+	}
+	return tokenAsFlag, nil
 }
 
 func main() {
@@ -56,55 +76,55 @@ func main() {
 	tle := le.CreateSubEngine("Transporter")
 	tle.AddLogPipeline(ale.Info, pCTX.Log)
 
-	// Checked before transporter parses the arguments, since it would print an inline token.
-	tokenAsFlag, tokenInline := tokenArgs(os.Args[1:])
-	if tokenInline {
-		le.Log(ale.Critical, "The API token can't be passed as --token=VALUE. Set the T_apitoken environment variable instead.")
+	//#region Transporter / Inputs / Parsing
+	inputs := transporter.Pattern{
+		Sequences: map[string]transporter.PatternSequence{
+			"acctid": {
+				Name:        "Account ID",
+				Description: "",
+				CLIFlags:    []string{"acctid"},
+				ENVVars:     []string{"acctid"},
+			},
+			"apitoken": {
+				Name:               "API Token",
+				Description:        "",
+				CLIFlags:           tokenFlags,
+				ENVVars:            []string{"apitoken"},
+				DisablePersistence: true,
+			},
+			"file": {
+				Name:               "File",
+				Description:        "",
+				CLIFlags:           []string{"file"},
+				ENVVars:            []string{"file"},
+				DisablePersistence: true,
+			},
+			"chunksize": {
+				Name:               "Chunk Size",
+				Description:        "",
+				CLIFlags:           []string{"chunksize"},
+				ENVVars:            []string{"chunksize"},
+				DisablePersistence: true,
+				Value:              "5",
+			},
+		},
+	}
+
+	// Checked before transporter reads the arguments, since it would print any it doesn't know.
+	tokenAsFlag, err := checkArgs(os.Args[1:], flagNames(inputs))
+	if err != nil {
+		le.Log(ale.Critical, fmt.Sprintf("Invalid arguments: %s", err))
 		os.Exit(1)
 	}
 
-	//#region Transporter / Inputs / Parsing
-	pattern, err2 := transporter.Energize(
-		transporter.Pattern{
-			Sequences: map[string]transporter.PatternSequence{
-				"acctid": {
-					Name:        "Account ID",
-					Description: "",
-					CLIFlags:    []string{"acctid"},
-					ENVVars:     []string{"acctid"},
-				},
-				"apitoken": {
-					Name:               "API Token",
-					Description:        "",
-					CLIFlags:           tokenFlags,
-					ENVVars:            []string{"apitoken"},
-					DisablePersistence: true,
-				},
-				"file": {
-					Name:               "File",
-					Description:        "",
-					CLIFlags:           []string{"file"},
-					ENVVars:            []string{"file"},
-					DisablePersistence: true,
-				},
-				"chunksize": {
-					Name:               "Chunk Size",
-					Description:        "",
-					CLIFlags:           []string{"chunksize"},
-					ENVVars:            []string{"chunksize"},
-					DisablePersistence: true,
-					Value:              "5",
-				},
-			},
-		}, transporter.TransporterOptions{
-			EnviormentPrefix:         "T_",
-			DumpEnvironmentVariables: false,
-			DumpCLIArguments:         false,
-			LogEngine:                tle,
-			LogEnginePConsoleCTX:     pCTX,
-			ConfigFileEngine:         nil,
-		},
-	)
+	pattern, err2 := transporter.Energize(inputs, transporter.TransporterOptions{
+		EnviormentPrefix:         "T_",
+		DumpEnvironmentVariables: false,
+		DumpCLIArguments:         false,
+		LogEngine:                tle,
+		LogEnginePConsoleCTX:     pCTX,
+		ConfigFileEngine:         nil,
+	})
 	if err2 != nil {
 		le.Log(ale.Critical, fmt.Sprintf("Transporter pattern failed to energize. Err: %s", err2))
 		os.Exit(1)

@@ -165,6 +165,7 @@ func TestDrawProgress(t *testing.T) {
 		{"waiting", progress{url: "u", err: errors.New("boom"), attempt: 2, retryIn: 4 * time.Second}, []string{"Status: Retrying in 4s (attempt 2 of 8). Err: boom"}},
 		{"retrying", progress{url: "u", err: errors.New("boom"), attempt: 2}, []string{"Status: Retrying (attempt 2 of 8). Err: boom"}},
 		{"retrying create", progress{err: errors.New("boom"), attempt: 1, retryIn: time.Second}, []string{"Status: Retrying in 1s (attempt 1 of 8). Err: boom"}},
+		{"server text", progress{url: "u", err: errors.New("bad\x1b[31m\n\treply"), attempt: 1}, []string{"Err: bad[31m reply"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

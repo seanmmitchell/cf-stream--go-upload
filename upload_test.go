@@ -35,15 +35,15 @@ type patchOutcome struct {
 
 // fakeTUS is a minimal TUS server for one upload.
 type fakeTUS struct {
-	mu        sync.Mutex
-	data      []byte
-	posts     int
-	patches   int
-	heads     int
-	patch     func(n int) patchOutcome // Picks the outcome of PATCH number n (from 1). Nil means always succeed.
-	post      func(n int) int          // Status to fail POST number n with, or 0 to succeed. Nil means always succeed.
-	head      func(n int) int          // Status to fail HEAD number n with, or 0 to succeed. Nil means always succeed.
-	headExtra int                      // HEAD reports an offset this many bytes past what is stored.
+	mu         sync.Mutex
+	data       []byte
+	posts      int
+	patches    int
+	heads      int
+	patch      func(n int) patchOutcome // Picks the outcome of PATCH number n (from 1). Nil means always succeed.
+	post       func(n int) int          // Status to fail POST number n with, or 0 to succeed. Nil means always succeed.
+	head       func(n int) int          // Status to fail HEAD number n with, or 0 to succeed. Nil means always succeed.
+	headOffset func(n int) int          // Offset HEAD number n reports. Nil means the stored length.
 }
 
 func (s *fakeTUS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -65,7 +65,11 @@ func (s *fakeTUS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(s.head(s.heads))
 			return
 		}
-		w.Header().Set("Upload-Offset", strconv.Itoa(len(s.data)+s.headExtra))
+		offset := len(s.data)
+		if s.headOffset != nil {
+			offset = s.headOffset(s.heads)
+		}
+		w.Header().Set("Upload-Offset", strconv.Itoa(offset))
 		w.WriteHeader(http.StatusOK)
 	case http.MethodPatch:
 		s.patches++
@@ -402,8 +406,8 @@ func TestUploadFileStopsWhenChunkReplyOffsetIsPastEnd(t *testing.T) {
 
 func TestUploadFileStopsWhenResyncOffsetIsPastEnd(t *testing.T) {
 	srv := &fakeTUS{
-		patch:     func(n int) patchOutcome { return patchOutcome{hangup: n == 2} },
-		headExtra: 100,
+		patch:      func(n int) patchOutcome { return patchOutcome{hangup: n == 2} },
+		headOffset: func(int) int { return 100 },
 	}
 	_, err := runUpload(t, srv, []byte("0123456789"))
 
@@ -412,6 +416,37 @@ func TestUploadFileStopsWhenResyncOffsetIsPastEnd(t *testing.T) {
 	}
 	if srv.heads != 1 || srv.patches != 2 {
 		t.Errorf("sent %d HEAD and %d PATCH requests, want 1 and 2", srv.heads, srv.patches)
+	}
+}
+
+func TestUploadFileGivesUpWhenResyncOffsetGoesBackAndForth(t *testing.T) {
+	// Every PATCH fails, and the server's offset alternates between 4 and 0.
+	// Only the first move to 4 is progress.
+	srv := &fakeTUS{
+		patch:      func(int) patchOutcome { return patchOutcome{discard: true, status: http.StatusServiceUnavailable} },
+		headOffset: func(n int) int { return 4 * (n % 2) },
+	}
+	client, upload := newTestUpload(t, srv, []byte("0123456789"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := uploadFile(ctx, client, upload, fastRetry, func(progress) {})
+
+	if err == nil || !strings.Contains(err.Error(), "gave up after 3 retries") {
+		t.Fatalf("uploadFile err = %v, want it to give up after 3 retries", err)
+	}
+}
+
+func TestUploadFileGivesUpWhenServerForgetsChunks(t *testing.T) {
+	// Each PATCH is acknowledged but not stored, so the next one gets 409 and
+	// the resync goes back to 0. Only the first acknowledgement is progress.
+	srv := &fakeTUS{patch: func(int) patchOutcome { return patchOutcome{discard: true, overreport: 4} }}
+	client, upload := newTestUpload(t, srv, []byte("0123456789"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err := uploadFile(ctx, client, upload, fastRetry, func(progress) {})
+
+	if err == nil || !strings.Contains(err.Error(), "gave up after 3 retries") {
+		t.Fatalf("uploadFile err = %v, want it to give up after 3 retries", err)
 	}
 }
 
@@ -427,8 +462,8 @@ func TestCheckOffset(t *testing.T) {
 }
 
 func TestPrintable(t *testing.T) {
-	in := "a\x1b]0;x\x07b\nc\td\u009bq\xff\x7fz é"
-	if got, want := printable(in), "a]0;xb c dqz é"; got != want {
+	in := "a\x1b]0;x\x07b\nc\td\u009bq\xff\x7fz é\r"
+	if got, want := printable(in), "a]0;xb\nc\tdqz é"; got != want {
 		t.Errorf("printable(%q) = %q, want %q", in, got, want)
 	}
 }

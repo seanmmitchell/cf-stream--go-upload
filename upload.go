@@ -112,15 +112,12 @@ func describe(err error) string {
 	return fmt.Sprintf("%s: %s", err, body)
 }
 
-// printable makes text that may come from the server safe to show in a
+// printable makes text that may come from the server safe to print to a
 // terminal: invalid UTF-8 and control characters (C0, DEL and C1, which can
-// start escape sequences) are dropped, and line breaks and tabs become spaces.
+// start escape sequences) are dropped, except line feeds and tabs.
 func printable(s string) string {
 	return strings.Map(func(r rune) rune {
-		switch {
-		case r == '\n' || r == '\r' || r == '\t':
-			return ' '
-		case unicode.IsControl(r):
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
 			return -1
 		}
 		return r
@@ -262,6 +259,10 @@ func uploadFile(ctx context.Context, client *tus.Client, upload *tus.Upload, ret
 	}
 
 	p, failures = progress{url: uploader.Url()}, 0
+	// best is the furthest offset the server has confirmed. Retries are
+	// counted afresh only when it moves forward, so a server whose offset
+	// goes back and forth can't keep the upload retrying forever.
+	best := uploader.Offset()
 	for uploader.Offset() < upload.Size() {
 		p.offset, p.retryIn = uploader.Offset(), 0
 		report(p)
@@ -278,7 +279,10 @@ func uploadFile(ctx context.Context, client *tus.Client, upload *tus.Upload, ret
 			if err := checkOffset(uploader.Offset(), upload.Size()); err != nil {
 				return err
 			}
-			failures, p.err, p.attempt = 0, nil, 0
+			p.err, p.attempt = nil, 0
+			if uploader.Offset() > best {
+				best, failures = uploader.Offset(), 0
+			}
 			continue
 		}
 
@@ -296,10 +300,10 @@ func uploadFile(ctx context.Context, client *tus.Client, upload *tus.Upload, ret
 		if err := checkOffset(uploader.Offset(), upload.Size()); err != nil {
 			return err
 		}
-		// The server stored data although the reply was lost, so the upload is
-		// still moving: count retries afresh, as after a successful chunk.
-		if uploader.Offset() > p.offset {
-			failures, p.err, p.attempt = 0, nil, 0
+		// The server may have stored data although the reply was lost. If so,
+		// the upload is still moving: count retries afresh.
+		if uploader.Offset() > best {
+			best, failures, p.err, p.attempt = uploader.Offset(), 0, nil, 0
 		}
 	}
 

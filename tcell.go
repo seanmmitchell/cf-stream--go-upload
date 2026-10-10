@@ -4,10 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
+	"github.com/gdamore/tcell/v2/terminfo"
 	"golang.org/x/term"
 )
 
@@ -102,6 +104,7 @@ func finish(screen tcell.Screen, timeout time.Duration, fallback func()) {
 type savedTerminal struct {
 	tty   *os.File
 	state *term.State
+	ti    *terminfo.Terminfo // The $TERM entry tcell uses, or nil if there is none.
 }
 
 // saveTerminal records the state of the controlling terminal, so restore can
@@ -117,18 +120,29 @@ func saveTerminal() *savedTerminal {
 		tty.Close()
 		return nil
 	}
-	return &savedTerminal{tty: tty, state: state}
+	ti, _ := tcell.LookupTerminfo(os.Getenv("TERM"))
+	return &savedTerminal{tty: tty, state: state, ti: ti}
 }
 
-// restore resets the terminal's mode to the saved state, then resets text
-// attributes, shows the cursor, turns line wrapping back on, leaves keypad
-// mode and leaves the alternate screen: what tcell's Fini would have done.
+// restore resets the terminal's mode to the saved state, then sends what
+// tcell's Fini would have: show the cursor, reset colors and attributes,
+// leave keypad mode, turn line wrapping back on, then clear the screen and
+// leave the alternate screen unless TCELL_ALTSCREEN=disable.
 func (t *savedTerminal) restore() {
 	if t == nil {
 		return
 	}
 	_ = term.Restore(int(t.tty.Fd()), t.state)
-	_, _ = t.tty.WriteString("\x1b[0m\x1b[?25h\x1b[?7h\x1b[?1l\x1b>\x1b[?1049l")
+	if t.ti == nil {
+		return
+	}
+	seqs := []string{t.ti.ShowCursor, t.ti.ResetFgBg, t.ti.AttrOff, t.ti.ExitKeypad, t.ti.EnableAutoMargin}
+	if os.Getenv("TCELL_ALTSCREEN") != "disable" {
+		seqs = append(seqs, t.ti.Clear, t.ti.ExitCA)
+	}
+	for _, s := range seqs {
+		t.ti.TPuts(t.tty, s)
+	}
 }
 
 func drawProgress(screen tcell.Screen, v view, p progress) {
@@ -166,7 +180,9 @@ func drawProgress(screen tcell.Screen, v view, p progress) {
 	default:
 		line = "Status: Uploading..."
 	}
-	tCellDraw(screen, 0, 7, screenW, 8, tcell.StyleDefault, printable(line))
+	// Errors may hold server text, line breaks included.
+	line = strings.Join(strings.Fields(printable(line)), " ")
+	tCellDraw(screen, 0, 7, screenW, 8, tcell.StyleDefault, line)
 
 	line = "Press Ctrl-C to cancel."
 	tCellDraw(screen, 0, 10, len(line), 10, tcell.StyleDefault, line)
