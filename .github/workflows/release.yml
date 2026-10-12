@@ -27,23 +27,36 @@ jobs:
       - id: resolve
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           INPUT_VERSION: ${{ inputs.version }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
           publish=false
           if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "tag" ]]; then
             version="$GITHUB_REF_NAME"
             publish=true
           elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && -n "$INPUT_VERSION" ]]; then
-            semver='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
-            if [[ ! "$INPUT_VERSION" =~ $semver ]]; then
-              echo "::error::version must look like v1.2.3 or v1.2.3-rc1"
+            # vMAJOR.MINOR.PATCH with an optional -prerelease; no +build metadata.
+            semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+            if [[ ! "$INPUT_VERSION" =~ $semver ]] || ! git check-ref-format "refs/tags/$INPUT_VERSION"; then
+              echo "::error::version must look like v1.2.3 or v1.2.3-rc.1"
               exit 1
             fi
             if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
               echo "::error::releases can only be dispatched from $DEFAULT_BRANCH"
+              exit 1
+            fi
+            # Fail before building if the version is tagged on another commit.
+            existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$INPUT_VERSION" \
+              --jq "map(select(.ref == \"refs/tags/$INPUT_VERSION\"))[0].object // empty | \"\(.type) \(.sha)\"")
+            if [[ "$existing" == "tag "* ]]; then
+              existing="commit $(gh api "repos/$GITHUB_REPOSITORY/git/tags/${existing#tag }" --jq .object.sha)"
+            fi
+            if [[ -n "$existing" && "${existing#* }" != "$GITHUB_SHA" ]]; then
+              echo "::error::tag $INPUT_VERSION already exists on another commit; choose a new version"
               exit 1
             fi
             version="$INPUT_VERSION"
@@ -141,36 +154,43 @@ jobs:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
           tag="$VERSION"
-          flags=()
-          # Tags like v1.2.0-rc1 are published as pre-releases; "+build"
-          # metadata is ignored when checking for the "-".
-          [[ "${tag%%+*}" == *-* ]] && flags+=(--prerelease)
 
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            # Create the tag at the commit that was just built. Never reuse an
-            # existing tag: its release would get binaries from another commit.
-            existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
-              --jq "map(select(.ref == \"refs/tags/$tag\")) | length")
-            if [[ "$existing" != "0" ]]; then
-              echo "::error::tag $tag already exists; choose a new version"
-              exit 1
+            # Create the tag first, in one atomic step, at the commit that was
+            # built. A tag that already exists must point at that same commit
+            # (a re-run): a release must never get another commit's binaries.
+            if ! gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+                -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA" >/dev/null; then
+              existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+                --jq "map(select(.ref == \"refs/tags/$tag\"))[0].object // empty | \"\(.type) \(.sha)\"")
+              if [[ "$existing" == "tag "* ]]; then
+                existing="commit $(gh api "repos/$GITHUB_REPOSITORY/git/tags/${existing#tag }" --jq .object.sha)"
+              fi
+              if [[ "${existing#* }" != "$GITHUB_SHA" ]]; then
+                echo "::error::could not create tag $tag at $GITHUB_SHA. If the API refused it (403/404), main has since changed workflow files: run the workflow again from the current main."
+                exit 1
+              fi
             fi
-            gh release create "$tag" dist/* \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$tag" \
-              --generate-notes \
-              --target "$GITHUB_SHA" \
-              "${flags[@]}"
+          fi
+
+          # A release may already exist for the tag: a re-run, or a draft
+          # written in the UI. Its assets are replaced and a draft is
+          # published. (With immutable releases enabled, a published release
+          # can't take new assets, so re-running a published one fails.)
+          if is_draft=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            if [[ "$is_draft" == "true" ]]; then
+              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
+            fi
             exit 0
           fi
 
-          # Tag push: re-runs, or a release already drafted in the UI, get
-          # their assets replaced instead of failing.
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
-            exit 0
-          fi
+          flags=()
+          # Tags like v1.2.0-rc1 are published as pre-releases; "+build"
+          # metadata (possible on pushed tags) is ignored when checking.
+          [[ "${tag%%+*}" == *-* ]] && flags+=(--prerelease)
           gh release create "$tag" dist/* \
             --repo "$GITHUB_REPOSITORY" \
             --title "$tag" \
